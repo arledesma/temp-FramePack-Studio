@@ -691,7 +691,7 @@ def worker(
             studio_module.current_generator.transformer.install_magcache(magcache)
         elif use_teacache:
             print("Setting Up TeaCache")
-            studio_module.current_generator.transformer.initialize_teacache(enable_teacache=True, num_steps=teacache_num_steps, rel_l1_thresh=teacache_rel_l1_thresh)
+            studio_module.current_generator.transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
             studio_module.current_generator.transformer.uninstall_magcache()
         else:
             print("No Transformer Cache in use")
