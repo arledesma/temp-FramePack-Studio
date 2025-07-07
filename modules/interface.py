@@ -636,7 +636,7 @@ def create_interface(
                                 magcache_max_consecutive_skips_update = gr.update(visible=enable_magcache)
                                 magcache_retention_ratio_update = gr.update(visible=enable_magcache)
 
-                                teacache_num_steps_update = gr.update(visible=enable_teacache)
+                                teacache_num_steps_update = gr.update(visible=False)
                                 teacache_rel_l1_thresh_update = gr.update(visible=enable_teacache)
 
                                 return [
