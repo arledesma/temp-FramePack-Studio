@@ -295,9 +295,9 @@ class BaseModelGenerator(ABC):
             lora_loaded_names: The master list of ALL available LoRA names, used for correct weight indexing.
             lora_values: A list of strength values corresponding to lora_loaded_names.
         """
-        self.unload_loras()
-
         if not selected_loras:
+            # Only unload at this point if no LoRAs are selected
+            self.unload_loras()
             print("No LoRAs selected, skipping loading.")
             return
 
@@ -394,6 +394,7 @@ class BaseModelGenerator(ABC):
                 print(f"Error loading LoRAs with kohya_ss loader: {e}")
                 traceback.print_exc()
         else:
+            self.unload_loras()
             adapter_names = []
             strengths = []
 

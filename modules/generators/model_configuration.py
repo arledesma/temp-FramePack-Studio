@@ -1,6 +1,7 @@
-from hashlib import md5
+import hashlib
+import json
 from typing import Optional, cast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 DEFAULT_WEIGHT: float = 0.8
 
@@ -188,7 +189,7 @@ class ModelConfiguration:
 
     @property
     def _hash(self) -> str:
-        return md5(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+        return hashlib.md5(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
 
     def add_lora_setting(self, setting: ModelLoraSetting) -> None:
         self.settings.add_lora_setting(setting)
@@ -205,38 +206,38 @@ class ModelConfiguration:
         return valid
 
     @staticmethod
-    def from_config(model_name: str, settings: ModelSettings | dict | None):
-        model_config: ModelSettings | None = None
+    def from_settings(model_name: str, settings: ModelSettings | dict | None):
+        model_settings: ModelSettings | None = None
         if settings is None:
-            model_config = ModelSettings()
+            model_settings = ModelSettings()
         elif isinstance(settings, ModelSettings):
-            model_config = settings
+            model_settings = settings
         elif isinstance(settings, dict):
-            model_config = ModelSettings(lora_settings=ModelLoraSetting.parse_settings(settings))
+            model_settings = ModelSettings(lora_settings=ModelLoraSetting.parse_settings(settings))
 
-        if model_config is None:
+        if model_settings is None:
             raise ValueError("Invalid config type for ModelConfiguration")
 
-        return ModelConfiguration(model_name=model_name, settings=model_config)
+        return ModelConfiguration(model_name=model_name, settings=model_settings)
 
     @staticmethod
     def from_lora_names_and_weights(model_name: str, lora_names: list[str], lora_weights: Optional[list[float | int]] = None) -> "ModelConfiguration":
         weights: list[float] = [float(weight) for weight in (lora_weights or [])]
         lora_settings = ModelLoraSetting.from_names_and_weights(lora_names, lora_weights=weights)
-        model_config = ModelSettings(lora_settings=lora_settings)
+        model_settings = ModelSettings(lora_settings=lora_settings)
         del weights, lora_settings
-        return ModelConfiguration.from_config(model_name=model_name, settings=model_config)
+        return ModelConfiguration.from_settings(model_name=model_name, settings=model_settings)
 
     def set_model_name(self, model_name: str) -> "ModelConfiguration":
         self.model_name = model_name
         return self
 
-    def set_config(self, config: ModelSettings) -> "ModelConfiguration":
-        self.config = config
+    def set_settings(self, settings: ModelSettings) -> "ModelConfiguration":
+        self.settings = settings
         return self
 
     def update_lora_setting(self, lora_settings: list[ModelLoraSetting] | str | list[str] | dict[str, dict]) -> "ModelConfiguration":
-        self.config.lora_settings = ModelLoraSetting.parse_settings(lora_settings)
+        self.settings.lora_settings = ModelLoraSetting.parse_settings(lora_settings)
         return self
 
 
@@ -251,9 +252,7 @@ if __name__ == '__main__':
     )
     logger.info(f"Model Name: {config.model_name}")
     logger.info(f"LoRA Settings: {config.settings.lora_settings}")
-    import dataclasses
-    import json
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     config.model_name = "changed"
     logger.debug("hash: {0}".format(config._hash))
@@ -263,10 +262,10 @@ if __name__ == '__main__':
     )
     logger.debug("hash: {0}".format(config._hash))
     config.settings.lora_settings.append(ModelLoraSetting(name="lora_D", weight=0.75))
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     config.add_lora("lora_E")
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     valid = config.validate()
     logger.debug("Config validation result: {0}".format(valid))
