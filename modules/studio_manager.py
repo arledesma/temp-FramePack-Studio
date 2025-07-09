@@ -111,10 +111,11 @@ class StudioManager:
         Delete the current model generator instance.
         This will set the current generator to None.
         """
-        self.__current_generator = None
+        self.__current_generator = None  # Reset the current generator
+        self.model_state = ModelState()  # Reset the model state
 
     def is_reload_required(self, model_name: str, selected_loras: list[str], lora_values: list[float], lora_loaded_names: list[str]) -> bool:
-        return self.model_state.is_reload_required(
+        return self.current_generator is None or self.model_state.is_reload_required(
             model_name=model_name,
             current_generator=self.__current_generator,
             selected_loras=selected_loras,
