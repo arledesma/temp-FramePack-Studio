@@ -336,6 +336,7 @@ def load_safetensors_with_fp8_optimization(
     """
     state_dict = {}
     if fp8_optimization:
+        raise RuntimeWarning("FP8 optimization is not yet supported in this version.")
         from .fp8_optimization_utils import (
             optimize_state_dict_with_fp8_on_the_fly,
         )

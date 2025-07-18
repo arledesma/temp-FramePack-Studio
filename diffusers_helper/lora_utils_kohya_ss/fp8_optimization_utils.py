@@ -161,7 +161,9 @@ def optimize_state_dict_with_fp8_on_the_fly(
     # Optimized layer counter
     optimized_count = 0
 
-    from . import MemoryEfficientSafeOpen
+    from diffusers_helper.lora_utils_kohya_ss.safetensors_utils import (
+        MemoryEfficientSafeOpen,
+    )
 
     state_dict = {}
 

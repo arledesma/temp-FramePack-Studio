@@ -1,60 +1,37 @@
-from diffusers_helper.hf_login import login
-
-import json
+# -*- coding: utf-8 -*-
+import argparse
 import os
 import shutil
-from pathlib import PurePath, Path
 import time
-import argparse
-import traceback
-import einops
+from pathlib import PurePath
+
+# Site packages
+from diffusers import AutoencoderKLHunyuanVideo
+from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+from transformers import SiglipImageProcessor, SiglipVisionModel
+import gradio as gr
 import numpy as np
 import torch
-import datetime
 
-# Version information
-from modules.version import APP_VERSION
+# Studio Module imports
+# Import from diffusers_helper
+from diffusers_helper.gradio.progress_bar import make_progress_bar_html
+from diffusers_helper.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+from diffusers_helper.thread_utils import AsyncStream
+from diffusers_helper.utils import generate_timestamp
+
+# Import from modules
+from modules import DUMMY_LORA_NAME # Import the constant
+from modules.interface import create_interface
+from modules.pipelines.worker import worker
+from modules.studio_manager import StudioManager
+from modules.ui.queue import format_queue_status
+from modules.video_queue import JobStatus
 
 # Set environment variables
 if not os.getenv('HF_HOME'):
     os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Prevent tokenizers parallelism warning
-
-
-
-import gradio as gr
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
-from diffusers import AutoencoderKLHunyuanVideo
-from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
-from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, generate_timestamp
-from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
-from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
-from diffusers_helper.thread_utils import AsyncStream
-from diffusers_helper.gradio.progress_bar import make_progress_bar_html
-from transformers import SiglipImageProcessor, SiglipVisionModel
-from diffusers_helper.clip_vision import hf_clip_vision_encode
-from diffusers_helper.bucket_tools import find_nearest_bucket
-from diffusers_helper import lora_utils
-from diffusers_helper.lora_utils import load_lora, unload_all_loras
-
-# Import model generators
-from modules.generators import create_model_generator, base_generator
-
-# Global cache for prompt embeddings
-prompt_embedding_cache = {}
-# Import from modules
-from modules.video_queue import VideoJobQueue, JobStatus
-from modules.prompt_handler import parse_timestamped_prompt
-from modules.ui.queue import format_queue_status
-from modules.interface import create_interface
-from modules.settings import Settings
-from modules import DUMMY_LORA_NAME # Import the constant
-from modules.pipelines.metadata_utils import create_metadata
-from modules.pipelines.worker import worker
-from typing import cast
 
 # Try to suppress annoyingly persistent Windows asyncio proactor errors
 if os.name == 'nt':  # Windows only
@@ -79,37 +56,6 @@ if os.name == 'nt':  # Windows only
     if hasattr(asyncio.proactor_events._ProactorBasePipeTransport, '_call_connection_lost'):
         asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = silence_event_loop_closed(
             asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost)
-            
-# ADDED: Debug function to verify LoRA state
-def verify_lora_state(transformer, label=""):
-    """Debug function to verify the state of LoRAs in a transformer model"""
-    if transformer is None:
-        print(f"[{label}] Transformer is None, cannot verify LoRA state")
-        return
-        
-    has_loras = False
-    if hasattr(transformer, 'peft_config'):
-        adapter_names = list(transformer.peft_config.keys()) if transformer.peft_config else []
-        if adapter_names:
-            has_loras = True
-            print(f"[{label}] Transformer has LoRAs: {', '.join(adapter_names)}")
-        else:
-            print(f"[{label}] Transformer has no LoRAs in peft_config")
-    else:
-        print(f"[{label}] Transformer has no peft_config attribute")
-        
-    # Check for any LoRA modules
-    for name, module in transformer.named_modules():
-        if hasattr(module, 'lora_A') and module.lora_A:
-            has_loras = True
-            # print(f"[{label}] Found lora_A in module {name}")
-        if hasattr(module, 'lora_B') and module.lora_B:
-            has_loras = True
-            # print(f"[{label}] Found lora_B in module {name}")
-            
-    if not has_loras:
-        print(f"[{label}] No LoRA components found in transformer")
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
@@ -172,10 +118,6 @@ image_encoder.requires_grad_(False)
 lora_dir = os.path.join(os.path.dirname(__file__), 'loras')
 os.makedirs(lora_dir, exist_ok=True)
 
-# Initialize LoRA support - moved scanning after settings load
-lora_names = []
-lora_values = [] # This seems unused for population, might be related to weights later
-
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Define default LoRA folder path relative to the script directory (used if setting is missing)
@@ -196,8 +138,16 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
-# Initialize settings
-settings = Settings()
+# Initialize the StudioManager instance - this is a singleton class, accessible globally without importing from __main__
+studio_manager = StudioManager()
+settings = studio_manager.settings
+
+# Set the worker function for the job queue - using the imported worker from modules/pipelines/worker.py
+studio_manager.job_queue.set_worker_function(worker)
+job_queue = studio_manager.job_queue
+
+# Global cache for prompt embeddings
+prompt_embedding_cache = {}
 
 # NEW: auto-cleanup on start-up option in Settings
 if settings.get("auto_cleanup_on_startup", False):
@@ -213,62 +163,31 @@ if settings.get("auto_cleanup_on_startup", False):
     print("--- Startup Cleanup Complete ---")
         
 # --- Populate LoRA names AFTER settings are loaded ---
-lora_folder_from_settings: str = settings.get("lora_dir", default_lora_folder) # Use setting, fallback to default
-print(f"Scanning for LoRAs in: {lora_folder_from_settings}")
-if os.path.isdir(lora_folder_from_settings):
-    try:
-        for root, _, files in os.walk(lora_folder_from_settings):
-            for file in files:
-                if file.endswith('.safetensors') or file.endswith('.pt'):
-                    lora_relative_path = os.path.relpath(os.path.join(root, file), lora_folder_from_settings)
-                    lora_name = str(PurePath(lora_relative_path).with_suffix(''))
-                    lora_names.append(lora_name)
-        print(f"Found LoRAs: {lora_names}")
-        # Temp solution for only 1 lora
-        if len(lora_names) == 1:
-            lora_names.append(DUMMY_LORA_NAME)
-    except Exception as e:
-        print(f"Error scanning LoRA directory '{lora_folder_from_settings}': {e}")
-else:
-    print(f"LoRA directory not found: {lora_folder_from_settings}")
-# --- End LoRA population ---
-
-
-# Create job queue
-job_queue = VideoJobQueue()
-
-# Function to load a LoRA file
-def load_lora_file(lora_file: str | PurePath):
-    raise NotImplementedError("This function is not used.")
-
-@torch.no_grad()
-def get_cached_or_encode_prompt(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, target_device):
-    """
-    Retrieves prompt embeddings from cache or encodes them if not found.
-    Stores encoded embeddings (on CPU) in the cache.
-    Returns embeddings moved to the target_device.
-    """
-    if prompt in prompt_embedding_cache:
-        print(f"Cache hit for prompt: {prompt[:60]}...")
-        llama_vec_cpu, llama_mask_cpu, clip_l_pooler_cpu = prompt_embedding_cache[prompt]
-        # Move cached embeddings (from CPU) to the target device
-        llama_vec = llama_vec_cpu.to(target_device)
-        llama_attention_mask = llama_mask_cpu.to(target_device) if llama_mask_cpu is not None else None
-        clip_l_pooler = clip_l_pooler_cpu.to(target_device)
-        return llama_vec, llama_attention_mask, clip_l_pooler
+def enumerate_lora_dir() -> list[str]:
+    lora_folder_from_settings: str = settings.get("lora_dir", default_lora_folder)  # Use setting, fallback to default
+    print(f"Scanning for LoRAs in: {lora_folder_from_settings}")
+    found_files: list[str] = []
+    if os.path.isdir(lora_folder_from_settings):
+        try:
+            for root, _, files in os.walk(lora_folder_from_settings):
+                for file in files:
+                    if file.endswith('.safetensors') or file.endswith('.pt'):
+                        lora_relative_path = os.path.relpath(os.path.join(root, file), lora_folder_from_settings)
+                        lora_name = str(PurePath(lora_relative_path).with_suffix(''))
+                        found_files.append(lora_name)
+            print(f"Found LoRAs: {len(found_files)}")
+            # Temp solution for only 1 lora
+            if len(found_files) == 1:
+                found_files.append(DUMMY_LORA_NAME)
+        except Exception as e:
+            print(f"Error scanning LoRA directory '{lora_folder_from_settings}': {e}")
     else:
-        print(f"Cache miss for prompt: {prompt[:60]}...")
-        llama_vec, clip_l_pooler = encode_prompt_conds(
-            prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
-        )
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        # Store CPU copies in cache
-        prompt_embedding_cache[prompt] = (llama_vec.cpu(), llama_attention_mask.cpu() if llama_attention_mask is not None else None, clip_l_pooler.cpu())
-        # Return embeddings already on the target device (as encode_prompt_conds uses the model's device)
-        return llama_vec, llama_attention_mask, clip_l_pooler
+        print(f"LoRA directory not found: {lora_folder_from_settings}")
+    # --- End LoRA population ---
+    return found_files
 
-# Set the worker function for the job queue - using the imported worker from modules/pipelines/worker.py
-job_queue.set_worker_function(worker)
+
+lora_names = enumerate_lora_dir()
 
 
 def process(
@@ -646,7 +565,7 @@ interface = create_interface(
     monitor_fn=monitor_job,
     end_process_fn=end_process,
     update_queue_status_fn=update_queue_status,
-    load_lora_file_fn=load_lora_file,
+    load_lora_file_fn=None,
     job_queue=job_queue,
     settings=settings,
     lora_names=lora_names # Explicitly pass the found LoRA names

@@ -1,9 +1,14 @@
-from hashlib import md5
+import hashlib
+import logging
+import json
 from typing import Optional, cast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+
+from diffusers_helper.lora_utils_kohya_ss.enums import LoraLoader
 
 DEFAULT_WEIGHT: float = 0.8
 
+__logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, eq=True)
 class ModelLoraSetting:
@@ -11,7 +16,7 @@ class ModelLoraSetting:
     Attributes:
         name: The name of the LoRA.
         weight: The weight of the LoRA. Typically between 0.0 and 1.0, but may be used up to 2.0 (or potentially higher).
-                Default is 1.0 (DEFAULT_WEIGHT).
+                Default is 0.8 (DEFAULT_WEIGHT).
         sequence: The sequence order of the LoRA when applied to the model.
                   Lower numbers indicate higher priority, loaded first.
                   The sequence is automatically assigned if not provided or if duplicates exist.
@@ -155,11 +160,11 @@ class ModelLoraSetting:
         if lora_weights is None:
             lora_weights = []
         if len(lora_names) != len(lora_weights):
-            print(
+            __logger.warning(
                 f"Warning: Mismatch in lengths of lora_names ({len(lora_names)}) and lora_weights ({len(lora_weights)}).")
             additional_weights = len(lora_names) - len(lora_weights)
             if additional_weights > 0:
-                print(f"Filling missing weights with default value {DEFAULT_WEIGHT}.")
+                __logger.info(f"Filling missing weights with default value {DEFAULT_WEIGHT}.")
                 lora_weights = (lora_weights) + [DEFAULT_WEIGHT] * additional_weights
             else:
                 lora_weights = (lora_weights)[:len(lora_names)]
@@ -173,6 +178,7 @@ class ModelLoraSetting:
 @dataclass
 class ModelSettings():
     lora_settings: list[ModelLoraSetting] = field(default_factory=list)
+    lora_loader: str = field(default=LoraLoader.DEFAULT.value)
 
     def add_lora_setting(self, setting: ModelLoraSetting) -> None:
         max_sequence = max((s.sequence for s in self.lora_settings if hasattr(s, 'sequence')), default=-1)
@@ -188,7 +194,7 @@ class ModelConfiguration:
 
     @property
     def _hash(self) -> str:
-        return md5(json.dumps(dataclasses.asdict(self), sort_keys=True).encode()).hexdigest()
+        return hashlib.md5(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
 
     def add_lora_setting(self, setting: ModelLoraSetting) -> None:
         self.settings.add_lora_setting(setting)
@@ -200,43 +206,52 @@ class ModelConfiguration:
         total_weights = sum([setting.weight for setting in self.settings.lora_settings])
         valid = 2 > total_weights > 0
         if not valid:
-            print("Warning: total weight for all LoRA may not perform well with the model ({0}). Total weight: {1}".format(
+            __logger.warning("Warning: total weight for all LoRA may not perform well with the model ({0}). Total weight: {1}".format(
                 self.model_name, total_weights))
         return valid
 
     @staticmethod
-    def from_config(model_name: str, settings: ModelSettings | dict | None):
-        model_config: ModelSettings | None = None
+    def from_settings(model_name: str, settings: ModelSettings | dict | None):
+        model_settings: ModelSettings | None = None
         if settings is None:
-            model_config = ModelSettings()
+            model_settings = ModelSettings()
         elif isinstance(settings, ModelSettings):
-            model_config = settings
+            model_settings = settings
         elif isinstance(settings, dict):
-            model_config = ModelSettings(lora_settings=ModelLoraSetting.parse_settings(settings))
+            model_settings = ModelSettings(lora_settings=ModelLoraSetting.parse_settings(settings))
 
-        if model_config is None:
+        if model_settings is None:
             raise ValueError("Invalid config type for ModelConfiguration")
 
-        return ModelConfiguration(model_name=model_name, settings=model_config)
+        return ModelConfiguration(model_name=model_name, settings=model_settings)
 
     @staticmethod
-    def from_lora_names_and_weights(model_name: str, lora_names: list[str], lora_weights: Optional[list[float | int]] = None) -> "ModelConfiguration":
+    def from_lora_names_and_weights(
+        model_name: str,
+        lora_names: list[str],
+        lora_weights: list[float | int],
+        lora_loader: str | LoraLoader,
+    ) -> "ModelConfiguration":
+        assert isinstance(model_name, str) and model_name, "model_name must be a non-empty string"
+        assert isinstance(lora_names, list) and all(isinstance(name, str) for name in lora_names), "lora_names must be a list of strings"
+        assert isinstance(lora_weights, list) and all(isinstance(weight, (float, int)) for weight in lora_weights), "lora_weights must be a list of floats or ints"
+        assert isinstance(lora_loader, (str, LoraLoader)), "lora_loader must be a string or LoraLoader enum"
+
         weights: list[float] = [float(weight) for weight in (lora_weights or [])]
         lora_settings = ModelLoraSetting.from_names_and_weights(lora_names, lora_weights=weights)
-        model_config = ModelSettings(lora_settings=lora_settings)
-        del weights, lora_settings
-        return ModelConfiguration.from_config(model_name=model_name, settings=model_config)
+        model_settings = ModelSettings(lora_settings=lora_settings, lora_loader=str(lora_loader))
+        return ModelConfiguration.from_settings(model_name=model_name, settings=model_settings)
 
     def set_model_name(self, model_name: str) -> "ModelConfiguration":
         self.model_name = model_name
         return self
 
-    def set_config(self, config: ModelSettings) -> "ModelConfiguration":
-        self.config = config
+    def set_settings(self, settings: ModelSettings) -> "ModelConfiguration":
+        self.settings = settings
         return self
 
     def update_lora_setting(self, lora_settings: list[ModelLoraSetting] | str | list[str] | dict[str, dict]) -> "ModelConfiguration":
-        self.config.lora_settings = ModelLoraSetting.parse_settings(lora_settings)
+        self.settings.lora_settings = ModelLoraSetting.parse_settings(lora_settings)
         return self
 
 
@@ -247,13 +262,12 @@ if __name__ == '__main__':
     config: ModelConfiguration = ModelConfiguration.from_lora_names_and_weights(
         model_name="test-model",
         lora_names=["lora1", "lora2", "lora3"],
-        lora_weights=[0.5, 0.5, 0.5]
+        lora_weights=[0.5, 0.5, 0.5],
+        lora_loader=LoraLoader.DIFFUSERS
     )
     logger.info(f"Model Name: {config.model_name}")
     logger.info(f"LoRA Settings: {config.settings.lora_settings}")
-    import dataclasses
-    import json
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     config.model_name = "changed"
     logger.debug("hash: {0}".format(config._hash))
@@ -263,10 +277,10 @@ if __name__ == '__main__':
     )
     logger.debug("hash: {0}".format(config._hash))
     config.settings.lora_settings.append(ModelLoraSetting(name="lora_D", weight=0.75))
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     config.add_lora("lora_E")
-    logger.debug(json.dumps(dataclasses.asdict(config), indent=4))
+    logger.debug(json.dumps(asdict(config), indent=4))
     logger.debug("hash: {0}".format(config._hash))
     valid = config.validate()
     logger.debug("Config validation result: {0}".format(valid))

@@ -1,14 +1,18 @@
 import torch
-import os  # required for os.path
+import os # required for os.path
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from diffusers_helper import lora_utils
 from typing import List, Optional, cast
 from pathlib import Path
 
+from diffusers_helper.lora_utils_kohya_ss.enums import LoraLoader
+from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+
 from ..settings import Settings
 from .model_configuration import ModelConfiguration
 
+# cSpell: ignore loras
 
 class BaseModelGenerator(ABC):
     """
@@ -67,11 +71,12 @@ class BaseModelGenerator(ABC):
         self.previous_model_configuration: ModelConfiguration | None = None
 
     @abstractmethod
-    def load_model(self) -> torch.nn.Module:
+    def load_model(self) -> HunyuanVideoTransformer3DModelPacked:
         """
         Load the transformer model.
-        This method should be implemented by each specific model generator.
         """
+        # this load_model function has the same implementation in all subclasses
+        # candidate for consolidation to directly implement here in the base class
         pass
 
     @abstractmethod
@@ -80,7 +85,43 @@ class BaseModelGenerator(ABC):
         Get the name of the model.
         This method should be implemented by each specific model generator.
         """
+        # this get_model_name function has the same implementation in all subclasses
+        # candidate for consolidation to directly implement here in the base class
         pass
+
+    @abstractmethod
+    def get_latent_paddings(self, total_latent_sections) -> list[int]:
+        raise NotImplementedError(
+            "get_latent_paddings must be implemented by the specific model generator subclass.")
+
+    @abstractmethod
+    def format_position_description(self, total_generated_latent_frames, current_pos, original_pos, current_prompt) -> str:
+        raise NotImplementedError(
+            "format_position_description must be implemented by the specific model generator subclass.")
+
+    @abstractmethod
+    def get_real_history_latents(self, history_latents: torch.Tensor, total_generated_latent_frames: int) -> torch.Tensor:
+        """
+        Get the real history latents by slicing the history latents tensor.
+        """
+        raise NotImplementedError(
+            "get_real_history_latents must be implemented by the specific model generator subclass.")
+
+    @abstractmethod
+    def update_history_latents(self, history_latents: torch.Tensor, generated_latents: torch.Tensor) -> torch.Tensor:
+        """
+        Update the history latents with the generated latents.
+        This method should be implemented by each specific model generator.
+
+        Args:
+            history_latents: The history latents
+            generated_latents: The generated latents
+
+        Returns:
+            The updated history latents
+        """
+        raise NotImplementedError(
+            "update_history_latents must be implemented by the specific model generator subclass.")
 
     @staticmethod
     def _get_snapshot_hash_from_refs(model_repo_id_for_cache: str) -> str | None:
@@ -126,6 +167,8 @@ class BaseModelGenerator(ABC):
         if not hasattr(self, 'model_path') or not self.model_path:
             print(
                 f"Warning: model_path not set in {self.__class__.__name__}. Cannot determine fallback for offline path.")
+            # raise error instead of returning None?
+            # raise ValueError(f"{self.__class__.__name__} must set model_path for offline loading.")
             return None
 
         snapshot_hash = self._get_snapshot_hash_from_refs(self.model_repo_id_for_cache)
@@ -235,37 +278,6 @@ class BaseModelGenerator(ABC):
 
         print(f"Moved all LoRA adapters to {target_device}")
 
-    @abstractmethod
-    def get_latent_paddings(self, total_latent_sections) -> list[int]:
-        raise NotImplementedError(
-            "get_latent_paddings must be implemented by the specific model generator subclass.")
-
-    @abstractmethod
-    def format_position_description(self, total_generated_latent_frames, current_pos, original_pos, current_prompt) -> str:
-        raise NotImplementedError(
-            "format_position_description must be implemented by the specific model generator subclass.")
-
-    @abstractmethod
-    def get_real_history_latents(self, history_latents: torch.Tensor, total_generated_latent_frames: int) -> torch.Tensor:
-        raise NotImplementedError(
-            "get_real_history_latents must be implemented by the specific model generator subclass.")
-
-    @abstractmethod
-    def update_history_latents(self, history_latents: torch.Tensor, generated_latents: torch.Tensor) -> torch.Tensor:
-        """
-        Update the history latents with the generated latents.
-        This method should be implemented by each specific model generator.
-
-        Args:
-            history_latents: The history latents
-            generated_latents: The generated latents
-
-        Returns:
-            The updated history latents
-        """
-        raise NotImplementedError(
-            "update_history_latents must be implemented by the specific model generator subclass.")
-
     def __compute_lora_state_hash(self, lora_config: ModelConfiguration) -> str:
         """
         Compute a simple hash representing the current state of LoRA adapters in the transformer.
@@ -295,9 +307,9 @@ class BaseModelGenerator(ABC):
             lora_loaded_names: The master list of ALL available LoRA names, used for correct weight indexing.
             lora_values: A list of strength values corresponding to lora_loaded_names.
         """
-        self.unload_loras()
-
         if not selected_loras:
+            # Only unload at this point if no LoRAs are selected
+            self.unload_loras()
             print("No LoRAs selected, skipping loading.")
             return
 
@@ -313,11 +325,18 @@ class BaseModelGenerator(ABC):
         print(f"Loading LoRAs: {selected_loras} with values: {selected_lora_values}")
 
         active_model_configuration: ModelConfiguration = ModelConfiguration.from_lora_names_and_weights(
-            self.get_model_name(), selected_loras, selected_lora_values)
+            self.get_model_name(),
+            selected_loras,
+            selected_lora_values,
+            self.settings.lora_loader
+        )
 
         active_model_hash = self.__compute_lora_state_hash(active_model_configuration)
         if active_model_hash == self.previous_model_hash:
-            # will never short circuit with current architecture since we create a new
+            # This can only happen if the model is not changed
+            # When the model is loaded we will always have the default previous_model_hash value
+            # The only time that this can happen is when settings.reuse_model_instance is True
+            # and the model is not changed, and the LoRAs are not changed.
             print("Model configuration unchanged, skipping reload.")
             return
 
@@ -330,9 +349,10 @@ class BaseModelGenerator(ABC):
 
         lora_dir = Path(lora_folder)
 
-        if self.settings.get("kohya_ss_lora_support", False):
+        if self.settings.lora_loader == LoraLoader.LORA_READY:
             from diffusers_helper.lora_utils_kohya_ss.lora_loader import load_and_apply_lora
-            print(f"Loading LoRAs using kohya_ss loader from {lora_dir}")
+            from diffusers_helper.lora_utils_kohya_ss.lora_check_helper import print_lora_status
+            print(f"Loading LoRAs using kohya_ss LoRAReady loader from {lora_dir}")
 
             def _find_model_files(model_path):
                 """Get state dictionary file from specified model path
@@ -340,7 +360,7 @@ class BaseModelGenerator(ABC):
                 import glob
                 model_root = os.environ['HF_HOME']  # './hf_download'?
                 subdir = os.path.join(model_root, 'hub', 'models--' + model_path.replace('/', '--'))
-                model_files = glob.glob(os.path.join(subdir, '**', '*.safetensors'), recursive=True)
+                model_files = glob.glob(os.path.join(subdir, '**', '*.safetensors'), recursive=True) + glob.glob(os.path.join(subdir, '**', '*.pt'), recursive=True)
                 model_files.sort()
                 return model_files
             try:
@@ -391,9 +411,11 @@ class BaseModelGenerator(ABC):
 
             except Exception as e:
                 import traceback
-                print(f"Error loading LoRAs with kohya_ss loader: {e}")
+                print(f"Error loading LoRAs with kohya_ss LoRAReady loader: {e}")
                 traceback.print_exc()
-        else:
+            return
+        elif self.settings.lora_loader == LoraLoader.DIFFUSERS:
+            self.unload_loras()
             adapter_names = []
             strengths = []
 
@@ -432,4 +454,6 @@ class BaseModelGenerator(ABC):
                 print(f"Activating adapters: {adapter_names} with strengths: {strengths}")
                 lora_utils.set_adapters(self.transformer, adapter_names, strengths)
 
-        self.verify_lora_state("After completing load_loras")
+            self.verify_lora_state("After completing load_loras")
+        else:
+            raise NotImplementedError("Unsupported LoRA loader: {}".format(self.settings.lora_loader))
